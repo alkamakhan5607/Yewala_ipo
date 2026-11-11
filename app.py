@@ -1,22 +1,28 @@
-"""Company research assistant: Flask backend + Claude API with web search."""
+"""Company research assistant: Flask backend + Gemini API (free tier) with Google Search."""
 import json
 import os
 import re
 import time
 from collections import defaultdict
 
-import anthropic
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request, send_from_directory
+from google import genai
+from google.genai import errors, types
 
 load_dotenv()
 
 app = Flask(__name__, static_folder="static")
-client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY from the environment
-MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-5-5")
+MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
+_client = None
+
+NO_SEARCH_NOTE = (
+    "Note: live web search was unavailable, so this report uses the model's "
+    "general knowledge and may be out of date."
+)
 
 SYSTEM_PROMPT = """You are an equity research assistant for retail investors in India.
-Research the company the user names using web search. Prefer primary sources: the
+Research the company the user names using Google Search. Prefer primary sources: the
 company's DRHP/RHP, annual reports, NSE/BSE filings, SEBI, and reputable news.
 
 Rules:
@@ -39,13 +45,18 @@ Return ONLY one JSON object (no markdown fences) with exactly these keys:
   "assessment": "Favourable" | "Mixed" | "Cautious" | "Insufficient data",
   "assessment_reason": string,
   "confidence": "Low" | "Medium" | "High",
-  "questions_before_investing": [string],
-  "sources": [{"title": string, "url": string}]
+  "questions_before_investing": [string]
 }"""
 
-# Very small in-memory rate limit: 5 requests per IP per 10 minutes.
 HITS = defaultdict(list)
 LIMIT, WINDOW = 5, 600
+
+
+def get_client():
+    global _client
+    if _client is None:
+        _client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+    return _client
 
 
 def rate_limited(ip: str) -> bool:
@@ -64,19 +75,44 @@ def parse_json(text: str) -> dict:
     return json.loads(match.group(0))
 
 
+def generate(company: str, use_search: bool):
+    config = types.GenerateContentConfig(
+        system_instruction=SYSTEM_PROMPT,
+        tools=[types.Tool(google_search=types.GoogleSearch())] if use_search else None,
+    )
+    return get_client().models.generate_content(
+        model=MODEL, contents=f"Research this company: {company}", config=config
+    )
+
+
+def sources_from(resp) -> list:
+    found, seen = [], set()
+    try:
+        chunks = resp.candidates[0].grounding_metadata.grounding_chunks or []
+    except (AttributeError, IndexError, TypeError):
+        return found
+    for chunk in chunks:
+        web = getattr(chunk, "web", None)
+        if web and web.uri and web.uri not in seen:
+            seen.add(web.uri)
+            found.append({"title": web.title or web.uri, "url": web.uri})
+    return found
+
+
 def research(company: str) -> dict:
-    messages = [{"role": "user", "content": f"Research this company: {company}"}]
-    tools = [{"type": "web_search_20250305", "name": "web_search", "max_uses": 6}]
-    for _ in range(3):  # a long search turn can pause; continue it
-        resp = client.messages.create(
-            model=MODEL, max_tokens=4000, system=SYSTEM_PROMPT,
-            tools=tools, messages=messages,
-        )
-        if resp.stop_reason != "pause_turn":
-            break
-        messages.append({"role": "assistant", "content": resp.content})
-    text = "".join(b.text for b in resp.content if b.type == "text")
-    return parse_json(text)
+    searched = True
+    try:
+        resp = generate(company, True)
+    except errors.APIError as e:
+        if getattr(e, "code", None) == 429:
+            raise
+        searched = False
+        resp = generate(company, False)
+    data = parse_json(resp.text or "")
+    data["sources"] = sources_from(resp) if searched else []
+    if not searched:
+        data["summary"] = f"{NO_SEARCH_NOTE} {data.get('summary', '')}"
+    return data
 
 
 @app.get("/")
@@ -93,11 +129,16 @@ def api_research():
         return jsonify(error="Too many requests. Try again in a few minutes."), 429
     try:
         return jsonify(research(company))
+    except KeyError:
+        return jsonify(error="The server is missing its GEMINI_API_KEY."), 500
     except (ValueError, json.JSONDecodeError):
         return jsonify(error="Could not build a report. Try again or rename the company."), 502
-    except anthropic.APIError:
+    except errors.APIError as e:
+        if getattr(e, "code", None) == 429:
+            return jsonify(error="The free daily limit is used up. Try again tomorrow."), 429
         return jsonify(error="The research service is unavailable. Try again shortly."), 503
 
 
 if __name__ == "__main__":
     app.run(debug=os.getenv("FLASK_DEBUG") == "1", port=int(os.getenv("PORT", 5000)))
+  
