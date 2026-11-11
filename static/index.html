@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Company Check</title>
+<style>
+:root{--bg:#f3f6f8;--ink:#12303b;--muted:#5b6f78;--line:#cfdae0;--good:#1f7a5a;--warn:#b7791f;--bad:#a63d2f;--field:#fff}
+@media (prefers-color-scheme:dark){:root{--bg:#0f1c22;--ink:#e6eef1;--muted:#93a8b1;--line:#2a3f49;--good:#4cc38f;--warn:#e0a84a;--bad:#e5776a;--field:#16272f}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.55 system-ui,sans-serif}
+main{max-width:720px;margin:0 auto;padding:32px 20px 64px}
+h1,h2{font-family:Georgia,"Times New Roman",serif;font-weight:700;line-height:1.2}
+h1{font-size:2rem;margin:0 0 6px}
+h2{font-size:1.15rem;margin:28px 0 8px;padding-top:14px;border-top:1px solid var(--line)}
+.lead{color:var(--muted);margin:0 0 24px}
+form{display:flex;gap:8px}
+input{flex:1;min-width:0;padding:12px;font:inherit;color:var(--ink);background:var(--field);border:1px solid var(--line);border-radius:6px}
+button{padding:12px 18px;font:inherit;font-weight:600;color:var(--bg);background:var(--ink);border:0;border-radius:6px;cursor:pointer}
+button:disabled{opacity:.5;cursor:wait}
+:focus-visible{outline:3px solid var(--warn);outline-offset:2px}
+#status{margin:20px 0;color:var(--muted)}
+#status.error{color:var(--bad)}
+.gauge{display:grid;grid-template-columns:repeat(3,1fr);gap:4px;margin:10px 0}
+.gauge span{padding:6px 4px;text-align:center;font-size:.85rem;border:1px solid var(--line);border-radius:4px;color:var(--muted)}
+.gauge .on{color:#fff;border-color:transparent;font-weight:700}
+ul{margin:0;padding-left:20px}li{margin:4px 0}
+.risk li::marker{color:var(--warn)}.flag li::marker{color:var(--bad)}.pos li::marker{color:var(--good)}
+.src a{color:var(--ink)}
+.disclaimer{margin-top:32px;padding-top:14px;border-top:1px solid var(--line);font-size:.85rem;color:var(--muted)}
+</style>
+</head>
+<body>
+<main>
+  <h1>Company Check</h1>
+  <p class="lead">Type a company or IPO name. You get a sourced research summary to help you decide for yourself.</p>
+  <form id="form">
+    <input id="company" placeholder="e.g. Hero Fincorp" maxlength="100" required aria-label="Company name">
+    <button id="go">Research</button>
+  </form>
+  <p id="status" role="status" aria-live="polite"></p>
+  <article id="report"></article>
+  <p class="disclaimer">This is automated research for education, not investment advice, and it can contain errors. Check the official offer document and consult a SEBI-registered investment adviser before investing.</p>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const COLORS = {Favourable:'var(--good)', Mixed:'var(--warn)', Cautious:'var(--bad)'};
+
+function el(tag, text, cls){
+  const e = document.createElement(tag);
+  if (text !== undefined) e.textContent = text;
+  if (cls) e.className = cls;
+  return e;
+}
+function section(title, content){
+  const wrap = el('section');
+  wrap.append(el('h2', title), content);
+  return wrap;
+}
+function list(items, cls){
+  const ul = el('ul', undefined, cls);
+  (items && items.length ? items : ['Not found']).forEach(t => ul.append(el('li', t)));
+  return ul;
+}
+function render(d){
+  const r = $('report'); r.replaceChildren();
+  r.append(el('h2', d.company), el('p', d.is_listed_or_ipo_status), el('p', d.summary));
+
+  const gauge = el('div', undefined, 'gauge');
+  ['Favourable','Mixed','Cautious'].forEach(k => {
+    const s = el('span', k);
+    if (k === d.assessment){ s.className = 'on'; s.style.background = COLORS[k]; }
+    gauge.append(s);
+  });
+  const verdict = el('div');
+  verdict.append(gauge, el('p', `${d.assessment} (confidence: ${d.confidence}). ${d.assessment_reason}`));
+  r.append(section('Overall view', verdict));
+
+  r.append(section('What the business does', el('p', d.business_model)));
+  r.append(section('Financial health', list(d.financial_health)));
+  r.append(section('Valuation', list(d.valuation)));
+  r.append(section('Strengths', list(d.positives, 'pos')));
+  r.append(section('Risks', list(d.risks, 'risk')));
+  r.append(section('Red flags', list(d.red_flags, 'flag')));
+  r.append(section('Ask before you invest', list(d.questions_before_investing)));
+
+  const src = el('ul', undefined, 'src');
+  (d.sources || []).filter(s => /^https?:\/\//.test(s.url)).forEach(s => {
+    const a = el('a', s.title || s.url); a.href = s.url; a.target = '_blank'; a.rel = 'noopener noreferrer';
+    const li = el('li'); li.append(a); src.append(li);
+  });
+  r.append(section('Sources', src));
+}
+
+$('form').addEventListener('submit', async e => {
+  e.preventDefault();
+  const status = $('status'), btn = $('go');
+  status.className = ''; status.textContent = 'Researching. This takes about a minute.';
+  btn.disabled = true; $('report').replaceChildren();
+  try {
+    const res = await fetch('/api/research', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({company: $('company').value})
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Something went wrong.');
+    status.textContent = ''; render(data);
+  } catch (err) {
+    status.className = 'error'; status.textContent = err.message;
+  } finally { btn.disabled = false; }
+});
+</script>
+</body>
+</html>
